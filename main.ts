@@ -7,7 +7,7 @@
 // In a trial the grader runs `node /bot/main.ts` with MAKEFUN_ENV_URL set, and then this file hands over to runner.ts
 // (the last lines below): keep that hand-over and runner.ts as they are, and write the CLI.
 
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 const FORMATS = ['auto', 'unified', 'search-replace', 'v4a', 'json'];
@@ -38,6 +38,25 @@ function patchLines(text: string): string[] {
 
 function safe(p: string): boolean {
   return p !== '' && !p.startsWith('/') && !p.includes('\\') && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..');
+}
+
+/**
+ * Refuse to write through a symbolic link: the path itself, or any ancestor directory of it, is a
+ * symlink in the starting tree, so writeFileSync would write to the link's target instead of the
+ * tree. Throws Fail('unsafe', p) for the edit that names the path.
+ */
+function assertNoSymlink(p: string): void {
+  const parts = p.split('/');
+  for (let i = 1; i <= parts.length; i++) {
+    const sub = parts.slice(0, i).join('/');
+    let st;
+    try {
+      st = lstatSync(sub);
+    } catch {
+      continue; // Missing (or unreachable) component: no symlink there.
+    }
+    if (st.isSymbolicLink()) throw new Fail('unsafe', p);
+  }
 }
 
 /** The tree as the edits leave it: changed paths in `now` (null: deleted), the rest read from disk. */
@@ -84,6 +103,7 @@ function jsonEdit(v: unknown): Edit | null {
   if (typeof p !== 'string') return null;
   const exists = (tree: Tree): string => {
     if (!safe(p)) throw new Fail('unsafe', p);
+    assertNoSymlink(p);
     const t = tree.get(p);
     if (t === null) throw new Fail('missing', p);
     return t;
@@ -92,6 +112,7 @@ function jsonEdit(v: unknown): Edit | null {
     const text = o.file_text;
     return (tree) => {
       if (!safe(p)) throw new Fail('unsafe', p);
+      assertNoSymlink(p);
       if (tree.get(p) !== null) throw new Fail('exists', p);
       tree.now.set(p, text);
     };
@@ -418,12 +439,15 @@ function applyHunks(before: string, hunks: Hunk[], strict: boolean, path: string
 function sectionEdit(s: Section, strict: boolean): Edit {
   const oldP = s.oldPath ?? s.renameFrom ?? s.diffOld ?? null;
   const newP = s.newPath ?? s.renameTo ?? s.diffNew ?? null;
-  const isCreate = s.newFile || oldP === null;
-  const isDelete = !isCreate && (s.delFile || newP === null);
+  // `/dev/null` means no file (SPEC.md section 6): it is a creation/deletion trigger, never a
+  // real path, so it must not fall through to the move branch, where safe() would reject it.
+  const isCreate = s.newFile || oldP === '/dev/null' || oldP === null;
+  const isDelete = !isCreate && (s.delFile || newP === '/dev/null' || newP === null);
   if (isCreate) {
     const p = newP ?? '';
     return (tree) => {
       if (!safe(p)) throw new Fail('unsafe', p);
+      assertNoSymlink(p);
       if (tree.get(p) !== null) throw new Fail('exists', p);
       const plus: string[] = [];
       let finalBreak = true;
@@ -444,6 +468,7 @@ function sectionEdit(s: Section, strict: boolean): Edit {
     const p = oldP ?? '';
     return (tree) => {
       if (!safe(p)) throw new Fail('unsafe', p);
+      assertNoSymlink(p);
       if (tree.get(p) === null) throw new Fail('missing', p);
       tree.now.set(p, null);
     };
@@ -454,6 +479,8 @@ function sectionEdit(s: Section, strict: boolean): Edit {
     return (tree) => {
       if (!safe(o)) throw new Fail('unsafe', o);
       if (!safe(n)) throw new Fail('unsafe', n);
+      assertNoSymlink(o);
+      assertNoSymlink(n);
       const before = tree.get(o);
       if (before === null) throw new Fail('missing', o);
       if (tree.get(n) !== null) throw new Fail('exists', n);
@@ -466,6 +493,7 @@ function sectionEdit(s: Section, strict: boolean): Edit {
   const p = oldP!;
   return (tree) => {
     if (!safe(p)) throw new Fail('unsafe', p);
+    assertNoSymlink(p);
     const before = tree.get(p);
     if (before === null) throw new Fail('missing', p);
     tree.now.set(p, applyHunks(before, s.hunks, strict, p));
@@ -600,6 +628,7 @@ function unifiedEdits(lines: string[], strict: boolean): Edit[] {
 function searchReplaceEdit(path: string, oldLines: string[], newLines: string[], strict: boolean): Edit {
   return (tree) => {
     if (!safe(path)) throw new Fail('unsafe', path);
+    assertNoSymlink(path);
     if (oldLines.length === 0) {
       if (tree.get(path) !== null) throw new Fail('exists', path);
       const text = newLines.length === 0 ? '' : newLines.join('\n') + '\n';
@@ -693,6 +722,7 @@ function isV4aSectionStart(t: string): boolean {
 function v4aAddEdit(path: string, secLines: string[]): Edit {
   return (tree) => {
     if (!safe(path)) throw new Fail('unsafe', path);
+    assertNoSymlink(path);
     if (tree.get(path) !== null) throw new Fail('exists', path);
     const text = secLines.length === 0 ? '' : secLines.join('\n') + '\n';
     tree.now.set(path, text);
@@ -702,6 +732,7 @@ function v4aAddEdit(path: string, secLines: string[]): Edit {
 function v4aDeleteEdit(path: string): Edit {
   return (tree) => {
     if (!safe(path)) throw new Fail('unsafe', path);
+    assertNoSymlink(path);
     if (tree.get(path) === null) throw new Fail('missing', path);
     tree.now.set(path, null);
   };
@@ -722,6 +753,8 @@ function v4aUpdateEdit(path: string, moveTo: string | null, chunks: V4aChunk[], 
   return (tree) => {
     if (!safe(path)) throw new Fail('unsafe', path);
     if (moveTo !== null && !safe(moveTo)) throw new Fail('unsafe', moveTo);
+    assertNoSymlink(path);
+    if (moveTo !== null) assertNoSymlink(moveTo);
     const before = tree.get(path);
     if (before === null) throw new Fail('missing', path);
     if (moveTo !== null && tree.get(moveTo) !== null) throw new Fail('exists', moveTo);
@@ -1025,6 +1058,20 @@ function run(args: string[]): { code: number; out: string[] } {
     rows.push({ key: p, line: `${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}` });
   }
   if (!check) {
+    // Last guard before any byte is written: re-check every changed path with lstat, so a
+    // symlink the edits somehow missed can never be written through or removed. Nothing has
+    // been written yet at this point, so refusing here still writes nothing.
+    for (const p of [...tree.now.keys()]) {
+      const was = tree.original(p);
+      const now = tree.now.get(p)!;
+      if (was === now) continue;
+      try {
+        assertNoSymlink(p);
+      } catch (e) {
+        if (e instanceof Fail) return { code: 1, out: [`error: ${e.code} ${e.path}`, `failed: 1 of ${edits.length} edits`] };
+        throw e;
+      }
+    }
     for (const p of [...tree.now.keys()]) {
       const was = tree.original(p);
       const now = tree.now.get(p)!;
